@@ -51,9 +51,8 @@ def register():
                 self.attention_config = AttentionConfig()
             if self.attention_config.backend is None:
                 self.attention_config.backend = AttentionBackendEnum.TREE_ATTN
-                logger.info("vllm-ctsd: forced EngineArgs.attention_config.backend to TREE_ATTN")
-            if getattr(self, "attention_backend", None) is None:
-                self.attention_backend = AttentionBackendEnum.TREE_ATTN
+            # NOTE: attention_backend is intentionally NOT set. It is mutually
+            # exclusive with attention_config.backend in vLLM arg_utils.py:1806-1810.
 
         au.EngineArgs.__post_init__ = _patched_post_init
     except Exception:
