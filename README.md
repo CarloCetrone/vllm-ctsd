@@ -7,13 +7,13 @@
 Install directly from GitHub via pip:
 
 ```bash
-pip install git+https://github.com/USER/vllm-ctsd.git
+pip install git+https://github.com/CarloCetrone/vllm-ctsd.git
 ```
 
 For editable local development:
 
 ```bash
-git clone https://github.com/USER/vllm-ctsd.git
+git clone https://github.com/CarloCetrone/vllm-ctsd.git
 cd vllm-ctsd
 pip install -e .
 ```
