@@ -4,7 +4,7 @@ from typing import Dict
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
-from vllm.v1.outputs import AsyncGPUModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.sampler import SamplerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -172,49 +172,36 @@ class CTSDGPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
         )
 
-        if not self.use_async_scheduling:
-            return output
-
-        async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-        )
-        self.input_batch.set_async_sampled_token_ids(
-            async_output.sampled_token_ids_cpu,
-            async_output.async_copy_ready_event,
-        )
-        return async_output
+        return output
 
     def _ctsd_cold_start(self, req_id, root_hidden, scheduler_output, slot_mappings):
         """Full tree forward pass for initial cold-start decode step."""
-        tree_logits, tree_token_ids, tree_slot_mapping = self._ctsd_forward_tree(
+        root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+        tree_logits_per_level, tree_token_ids, tree_start_pos = self._ctsd_forward_tree(
             root_hidden, scheduler_output, slot_mappings
         )
         committed, winning_path_idx, _ = ctsd_select(
-            tree_logits,
+            tree_logits_per_level,
             tree_token_ids,
             self._path_indices,
             self._path_lengths,
             self._path_first_token_idx,
+            root_logits=root_logits,
         )
 
-        num_sched = scheduler_output.num_scheduled_tokens.get(req_id, 1)
-        num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
-        tree_start_pos = num_computed + num_sched
+        all_node_logits = torch.cat([root_logits.unsqueeze(0), tree_logits_per_level], dim=0)
+        all_tree_token_ids = torch.cat(
+            [torch.tensor([-1], dtype=torch.int64, device=tree_token_ids.device), tree_token_ids]
+        )
 
-        root_logits = tree_logits[0]
         _, state = create_initial_state(
             req_id=req_id,
             breadth=self._ctsd_config.breadth,
             depth=self._ctsd_config.depth,
             tree_start_pos=tree_start_pos,
             root_logits=root_logits,
-            tree_token_ids=tree_token_ids,
-            all_node_logits=tree_logits,
+            tree_token_ids=all_tree_token_ids,
+            all_node_logits=all_node_logits,
             winning_path_idx=winning_path_idx,
             paths=self._ctsd_topology["paths"],
             cu_level_counts=self._ctsd_topology["cu_level_counts"],
@@ -225,6 +212,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         """Steady-state decode step forwarding only the B^D new leaves."""
         breadth = self._ctsd_config.breadth
         depth = self._ctsd_config.depth
+        device = self.device
         num_leaves = breadth ** depth
 
         # 1. Expand frontier to new leaves
@@ -240,26 +228,35 @@ class CTSDGPUModelRunner(GPUModelRunner):
             (num_leaves,),
             state.tree_start_pos + depth - 1,
             dtype=torch.int64,
-            device=self.device,
+            device=device,
         )
         b_nums = leaf_pos // block_size
         b_ids = block_table.gather(dim=0, index=b_nums)
         slot_mapping = (b_ids * block_size + leaf_pos % block_size).to(torch.int32)
 
         # 3. Build CTSDTreeAttentionMetadata
+        interior_size = self._ctsd_tree_size - num_leaves  # B + B^2 + ... + B^(D-1)
+        row_start = interior_size + 1
+        row_end = self._ctsd_tree_size + 1
+        col_end = self._ctsd_tree_size + 1
+        tree_attn_bias = self._ctsd_tree_attn_bias[row_start:row_end, 0:col_end].contiguous()
+        assert tree_attn_bias.shape == (num_leaves, self._ctsd_tree_size + 1)
+
+        seq_len_now = state.tree_start_pos + self._ctsd_tree_size
+
         meta = CTSDTreeAttentionMetadata(
             num_actual_tokens=num_leaves,
             max_query_len=num_leaves,
-            query_start_loc=torch.tensor([0, num_leaves], dtype=torch.int32, device=self.device),
-            max_seq_len=int(scheduler_output.seq_lens[0]) + depth,
-            seq_lens=torch.tensor([int(scheduler_output.seq_lens[0]) + depth], dtype=torch.int32, device=self.device),
-            block_table=self.input_batch.block_table[0].unsqueeze(0),
+            query_start_loc=torch.tensor([0, num_leaves], dtype=torch.int32, device=device),
+            max_seq_len=seq_len_now,
+            seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
+            block_table=block_table.unsqueeze(0),
             slot_mapping=slot_mapping,
             num_prefill_tokens=0,
             num_decode_tokens=num_leaves,
             num_prefills=0,
             num_decodes=1,
-            tree_attn_bias=self._ctsd_tree_attn_bias[1:, 1:],
+            tree_attn_bias=tree_attn_bias,
             tree_start_pos=state.tree_start_pos,
             tree_size=self._ctsd_tree_size,
         )
@@ -293,102 +290,96 @@ class CTSDGPUModelRunner(GPUModelRunner):
         return committed, new_state
 
     def _ctsd_forward_tree(self, root_hidden, scheduler_output, slot_mappings):
-        """Orchestrate GPU forward pass for CTSD candidate tree during cold start."""
         root_logits = self.model.compute_logits(root_hidden).squeeze(0)
-        vocab_size = root_logits.shape[-1]
-        tree_size = self._ctsd_tree_size
         breadth = self._ctsd_config.breadth
         depth = self._ctsd_config.depth
-
-        tree_token_ids = torch.empty(
-            tree_size + 1, dtype=torch.int64, device=self.device
-        )
-        tree_token_ids[0] = -1
-
-        tree_logits = torch.zeros(
-            tree_size + 1, vocab_size, dtype=torch.float32, device=self.device
-        )
-        tree_logits[0] = root_logits
+        device = self.device
 
         req_id = self.input_batch.req_ids[0]
         num_sched = scheduler_output.num_scheduled_tokens.get(req_id, 1)
         num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
-        current_prefix_len = num_computed + num_sched
+        # Absolute RoPE position of the first level-1 tree node.
+        tree_start_pos = num_computed + num_sched
 
         block_table = self.input_batch.block_table[0]
         block_size = self.attn_groups[0][0].kv_cache_spec.block_size
 
-        # Level 1 expansion
-        top_ids, _ = root_topk(root_logits, breadth)
-        tree_token_ids[1 : 1 + breadth] = top_ids
-        tree_logits[1 : 1 + breadth] = root_logits.unsqueeze(0).expand(
-            breadth, -1
-        )
+        all_level_logits = []   # list of [B^k, V]
+        all_level_tokens = []   # list of [B^k] int64
 
-        level_starts = [1] + [
-            1 + self._cu_level_counts[i]
-            for i in range(len(self._cu_level_counts) - 1)
-        ]
+        parent_logits = root_logits.unsqueeze(0)  # [1, V]
+        level_offset = 0  # number of nodes in all levels before the current one
 
-        slot_mapping_last = None
+        for k in range(1, depth + 1):
+            num_children_per_parent = breadth
+            # Top-k for every parent at the previous level
+            top_ids, _ = expand_level(parent_logits, num_children_per_parent)  # [num_parents, B]
+            level_tokens = top_ids.reshape(-1)  # [num_parents * B] = [B^k]
 
-        if depth > 1:
-            curr_parent_logits = None
-            for lvl in range(1, depth):
-                start_idx = level_starts[lvl - 1]
-                cnt = self._level_counts[lvl - 1]
-                end_idx = start_idx + cnt
+            num_nodes_this_level = level_tokens.shape[0]
+            # Absolute positions: all level-k nodes sit at RoPE position tree_start_pos + k - 1
+            level_positions = torch.full(
+                (num_nodes_this_level,), tree_start_pos + k - 1,
+                dtype=torch.int64, device=device,
+            )
 
-                lvl_tokens = tree_token_ids[start_idx:end_idx]
-                lvl_pos = torch.full(
-                    (cnt,),
-                    current_prefix_len + lvl - 1,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+            # Slot mapping via block table
+            block_numbers = level_positions // block_size
+            block_ids = block_table.gather(dim=0, index=block_numbers)
+            slot_mapping = (block_ids * block_size + level_positions % block_size).to(torch.int32)
 
-                b_nums = lvl_pos // block_size
-                b_ids = block_table.gather(dim=0, index=b_nums)
-                lvl_slot = (b_ids * block_size + lvl_pos % block_size).to(
-                    torch.int32
-                )
-                slot_mapping_last = lvl_slot
+            # Row range in the full tree bias: node indices at level k are
+            # [level_offset + 1, level_offset + num_nodes_this_level + 1)
+            # (index 0 is root). Columns include root + all nodes up to level k.
+            row_start = level_offset + 1
+            row_end = row_start + num_nodes_this_level
+            col_end = level_offset + num_nodes_this_level + 1  # inclusive of root
+            tree_attn_bias = self._ctsd_tree_attn_bias[row_start:row_end, 0:col_end].contiguous()
 
-                # Forward pass for this level to get hidden states
+            # seq_lens for the kernel: prefix + all tree nodes written so far
+            # (nodes at levels 1..k have been written at this point).
+            tree_nodes_written = level_offset + num_nodes_this_level
+            prefix_len = tree_start_pos
+            seq_len_now = prefix_len + tree_nodes_written
+
+            meta = CTSDTreeAttentionMetadata(
+                num_actual_tokens=num_nodes_this_level,
+                max_query_len=num_nodes_this_level,
+                query_start_loc=torch.tensor([0, num_nodes_this_level], dtype=torch.int32, device=device),
+                max_seq_len=seq_len_now,
+                seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
+                block_table=block_table.unsqueeze(0),
+                slot_mapping=slot_mapping,
+                num_prefill_tokens=0,
+                num_decode_tokens=num_nodes_this_level,
+                num_prefills=0,
+                num_decodes=1,
+                tree_attn_bias=tree_attn_bias,
+                tree_start_pos=tree_start_pos,
+                tree_size=tree_nodes_written,
+            )
+
+            per_layer_meta = {name: meta for name in self.attn_groups[0][0].layer_names}
+
+            with set_forward_context(
+                per_layer_meta,
+                self.vllm_config,
+                num_tokens=num_nodes_this_level,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=slot_mapping,
+            ):
                 hidden = self._model_forward(
-                    input_ids=lvl_tokens.to(torch.int32),
-                    positions=lvl_pos,
-                )
-                curr_parent_logits = self.model.compute_logits(hidden)
-
-                # Next level child tokens
-                next_start = level_starts[lvl]
-                next_top_ids, _ = expand_level(curr_parent_logits, breadth)
-                next_cnt = cnt * breadth
-                tree_token_ids[next_start : next_start + next_cnt] = (
-                    next_top_ids.view(-1)
+                    input_ids=level_tokens.to(torch.int32),
+                    positions=level_positions,
                 )
 
-                # Populate tree_logits for children with their parent distribution
-                for p_idx in range(cnt):
-                    c_start = next_start + p_idx * breadth
-                    tree_logits[c_start : c_start + breadth] = (
-                        curr_parent_logits[p_idx].unsqueeze(0).expand(
-                            breadth, -1
-                        )
-                    )
+            level_logits = self.model.compute_logits(hidden)  # [B^k, V]
+            all_level_logits.append(level_logits)
+            all_level_tokens.append(level_tokens)
+            parent_logits = level_logits
+            level_offset += num_nodes_this_level
 
-        if slot_mapping_last is None:
-            pos = torch.full(
-                (breadth,),
-                current_prefix_len,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            b_nums = pos // block_size
-            b_ids = block_table.gather(dim=0, index=b_nums)
-            slot_mapping_last = (b_ids * block_size + pos % block_size).to(
-                torch.int32
-            )
-
-        return tree_logits, tree_token_ids, slot_mapping_last
+        # Concatenate to BFS order: level 1, then level 2, ...
+        tree_token_ids = torch.cat(all_level_tokens, dim=0)      # [tree_size]
+        tree_logits_per_level = torch.cat(all_level_logits, dim=0)  # [tree_size, V]
+        return tree_logits_per_level, tree_token_ids, tree_start_pos

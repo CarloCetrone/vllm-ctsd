@@ -35,18 +35,25 @@ def test_ctsd_select_deterministic():
 
     V = 10
     tree_size = 6
-    logits = torch.zeros(tree_size + 1, V)
-    token_ids = torch.tensor([-1, 5, 8, 3, 2, 7, 4], dtype=torch.int64)
+    # Root logits: level-1 logprobs from root
+    root_logits = torch.zeros(V)
+    root_logits[5] = 10.0  # High probability for token 5 (node 1)
+
+    # tree_logits_per_level: level-k logprobs from parent_idx
+    # Node 1 is at index 0 of tree_logits_per_level. It predicts its children (nodes 3 and 4).
+    tree_logits_per_level = torch.zeros(tree_size, V)
+    tree_logits_per_level[0, 2] = 10.0  # Node 1 gives high probability to token 2 (node 4)
+
+    token_ids = torch.tensor([5, 8, 3, 2, 7, 4], dtype=torch.int64)
 
     # Path 1: root -> node 1 (token 5) -> node 4 (token 2)
-    # Give high logits to token 5 at row 1 and 2 (from root), and token 2 at row 3 and 4 (from node 1)
-    logits[1, 5] = 10.0
-    logits[2, 5] = 10.0
-    logits[3, 2] = 10.0
-    logits[4, 2] = 10.0
-
     committed_token, best_path_idx, avg_logprobs = ctsd_select(
-        logits, token_ids, paths_tensor, lengths_tensor, first_tok_tensor
+        root_logits,
+        tree_logits_per_level,
+        token_ids,
+        paths_tensor,
+        lengths_tensor,
+        first_tok_tensor,
     )
 
     assert best_path_idx == 1
@@ -54,3 +61,4 @@ def test_ctsd_select_deterministic():
     assert avg_logprobs[1] > avg_logprobs[0]
     assert avg_logprobs[1] > avg_logprobs[2]
     assert avg_logprobs[1] > avg_logprobs[3]
+

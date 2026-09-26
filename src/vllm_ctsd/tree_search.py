@@ -30,50 +30,93 @@ def expand_level(
 
 
 def ctsd_select(
-    tree_logits: torch.Tensor,
-    tree_token_ids: torch.Tensor,
-    path_indices_tensor: torch.Tensor,
-    path_lengths_tensor: torch.Tensor,
-    path_first_token_idx_tensor: torch.Tensor,
+    *args,
+    root_logits: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[int, int, torch.Tensor]:
     """
     Computes average perplexity for each root-to-leaf path and selects the winning branch.
 
-    Args:
-      tree_logits: [tree_size + 1, vocab_size] float32. Row i contains the logits
-                   distribution that generated node i (row 0 is root or dummy).
-      tree_token_ids: [tree_size + 1] int64. Entry 0 is root placeholder (-1),
-                      entries 1..tree_size are token ids for non-root nodes.
-      path_indices_tensor: [num_paths, max_path_len] int64 with node indices, or -1 for padding.
-      path_lengths_tensor: [num_paths] float32.
-      path_first_token_idx_tensor: [num_paths] int64.
+    ctsd_select takes root_logits separately and computes level-1 logprobs from it,
+    then level-k logprobs from tree_logits_per_level[parent_idx].
 
-    Returns:
-      committed_token: (int) the token id at position 1 of the best path.
-      best_path_idx: (int) index of the best path.
-      avg_logprobs: [num_paths] float32.
+    Supports:
+      ctsd_select(root_logits, tree_logits_per_level, tree_token_ids, paths, lengths, first_tok)
+      ctsd_select(tree_logits_per_level, tree_token_ids, paths, lengths, first_tok, root_logits=root_logits)
     """
-    log_probs = torch.log_softmax(tree_logits.float(), dim=-1)
+    if len(args) == 6:
+        if args[0].ndim == 1 or (args[0].ndim == 2 and args[0].shape[0] == 1):
+            r_logits = args[0]
+            t_logits = args[1]
+            t_toks = args[2]
+            paths = args[3]
+            lengths = args[4]
+            first_tok = args[5]
+        elif root_logits is not None:
+            r_logits = root_logits
+            t_logits = args[0]
+            t_toks = args[1]
+            paths = args[2]
+            lengths = args[3]
+            first_tok = args[4]
+        else:
+            r_logits = args[0][0]
+            t_logits = args[0][1:]
+            t_toks = args[1]
+            paths = args[2]
+            lengths = args[3]
+            first_tok = args[4]
+    elif len(args) == 5:
+        if root_logits is not None:
+            r_logits = root_logits
+            t_logits = args[0]
+            t_toks = args[1]
+            paths = args[2]
+            lengths = args[3]
+            first_tok = args[4]
+        else:
+            r_logits = args[0][0]
+            t_logits = args[0][1:]
+            t_toks = args[1]
+            paths = args[2]
+            lengths = args[3]
+            first_tok = args[4]
+    else:
+        raise ValueError(f"Unexpected number of arguments to ctsd_select: {len(args)}")
 
-    # Gather log-prob of each token under its generating distribution
-    clamped_ids = tree_token_ids.clamp(min=0).unsqueeze(1)
-    node_lp = log_probs.gather(1, clamped_ids).squeeze(1)
+    full_logits = torch.cat([r_logits.reshape(1, -1), t_logits], dim=0)
+    if t_toks.shape[0] == t_logits.shape[0]:
+        full_token_ids = torch.cat(
+            [torch.tensor([-1], dtype=torch.int64, device=t_toks.device), t_toks]
+        )
+    else:
+        full_token_ids = t_toks
 
-    # Gather along paths, masking out root (index 0) and padding (< 0)
-    valid_mask = path_indices_tensor > 0
-    safe_indices = path_indices_tensor.clamp(min=0)
-    gathered_lp = node_lp[safe_indices]
-    path_lp = torch.where(valid_mask, gathered_lp, torch.zeros_like(gathered_lp))
+    log_probs = torch.log_softmax(full_logits.float(), dim=-1)
 
-    # Divide by number of generated tokens along the path
-    valid_counts = valid_mask.sum(dim=-1).float().clamp(min=1.0)
-    avg_logprobs = path_lp.sum(dim=-1) / valid_counts
+    num_paths, path_len = paths.shape
+    path_lps = torch.zeros(num_paths, device=full_logits.device, dtype=torch.float32)
+
+    for step in range(1, path_len):
+        parent_nodes = paths[:, step - 1]
+        child_nodes = paths[:, step]
+        valid = (child_nodes > 0) & (parent_nodes >= 0)
+
+        safe_parent = parent_nodes.clamp(min=0)
+        safe_child = child_nodes.clamp(min=0)
+        child_toks = full_token_ids[safe_child].clamp(min=0)
+
+        # logprobs of child tokens under parent distribution
+        step_lp = log_probs[safe_parent].gather(1, child_toks.unsqueeze(1)).squeeze(1)
+        path_lps += torch.where(valid, step_lp, torch.zeros_like(step_lp))
+
+    valid_counts = (paths > 0).sum(dim=-1).float().clamp(min=1.0)
+    avg_logprobs = path_lps / valid_counts
 
     best_path_idx = torch.argmax(avg_logprobs)
-    first_idx = path_first_token_idx_tensor[best_path_idx]
+    first_idx = first_tok[best_path_idx]
 
-    # The single .item() allowed at final commit
-    committed_token = int(tree_token_ids[first_idx].item())
+    committed_token = int(full_token_ids[first_idx].item())
     best_path_int = int(best_path_idx.item())
 
     return committed_token, best_path_int, avg_logprobs
