@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ctsd"
+version = "0.1.0"
+description = "Cautious Tree Search Decoding plugin for vLLM"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+ctsd = "vllm_ctsd.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
