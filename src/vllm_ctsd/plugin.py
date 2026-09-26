@@ -20,7 +20,26 @@ def register():
         f"depth={cfg.depth} tree_size={cfg.tree_size}"
     )
 
-    # Patch 1 — model runner
+    # 1. Register vendored CTSD attention custom ops
+    try:
+        from vllm_ctsd.kernels import register_ctsd_attention_ops
+        register_ctsd_attention_ops()
+    except Exception:
+        logger.exception("vllm-ctsd: failed to register CTSD attention ops")
+
+    # 2. Patch TreeAttention backend to use CTSDTreeAttentionImpl
+    try:
+        import vllm.v1.attention.backends.tree_attn as tree_attn_module
+        from vllm_ctsd.tree_attention import CTSDTreeAttentionImpl
+        tree_attn_module.TreeAttentionImpl = CTSDTreeAttentionImpl
+        if hasattr(tree_attn_module, "TreeAttentionBackend"):
+            tree_attn_module.TreeAttentionBackend.get_impl_cls = staticmethod(
+                lambda: CTSDTreeAttentionImpl
+            )
+    except Exception:
+        logger.exception("vllm-ctsd: failed to patch TreeAttentionImpl")
+
+    # 3. Patch Model Runner
     try:
         import vllm.v1.worker.gpu_model_runner as gmr_module
         from vllm_ctsd.model_runner import CTSDGPUModelRunner
@@ -37,7 +56,7 @@ def register():
     except Exception:
         logger.exception("vllm-ctsd: failed to patch GPUModelRunner")
 
-    # Patch 2 — scheduler lookahead reservation
+    # 4. Patch Scheduler lookahead reservation
     try:
         from vllm.v1.core.sched.scheduler import Scheduler
 
