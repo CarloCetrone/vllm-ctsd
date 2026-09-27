@@ -2,11 +2,31 @@ import logging
 import torch
 from typing import Dict
 
-from vllm.config import CUDAGraphMode
-from vllm.forward_context import set_forward_context
-from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.sample.sampler import SamplerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+try:
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import set_forward_context
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.sample.sampler import SamplerOutput
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+except ImportError:
+    class CUDAGraphMode:
+        NONE = 0
+
+    class GPUModelRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ModelRunnerOutput:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class SamplerOutput:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def set_forward_context(*args, **kwargs):
+        from contextlib import nullcontext
+        return nullcontext()
 
 from vllm_ctsd.config import CTSDConfig
 from vllm_ctsd.tree_attention import CTSDTreeAttentionMetadata
@@ -129,6 +149,48 @@ class CTSDGPUModelRunner(GPUModelRunner):
             return bt.block_table.gpu[0]
         return bt[0]
 
+    def _get_ctsd_block_table(self, tree_start_pos: int) -> torch.Tensor:
+        """
+        Build a CTSD block table that maps prefix positions to the real block table
+        and tree candidate positions to scratch blocks at the top of the KV cache,
+        preventing unallocated block indices from overwriting physical Block 0 (the prompt).
+        """
+        block_table_tensor = self._get_block_table_tensor()
+        block_size = self.attn_groups[0][0].kv_cache_spec.block_size
+        device = block_table_tensor.device
+
+        num_prefix_blocks = (
+            ((tree_start_pos - 1) // block_size) + 1 if tree_start_pos > 0 else 0
+        )
+        max_tree_seq_pos = tree_start_pos + self._ctsd_tree_size
+        num_total_blocks_needed = ((max_tree_seq_pos - 1) // block_size) + 1
+        num_scratch_needed = max(0, num_total_blocks_needed - num_prefix_blocks)
+
+        ctsd_block_table = block_table_tensor.clone()
+        if num_total_blocks_needed > ctsd_block_table.shape[0]:
+            extra = torch.zeros(
+                num_total_blocks_needed - ctsd_block_table.shape[0],
+                dtype=ctsd_block_table.dtype,
+                device=device,
+            )
+            ctsd_block_table = torch.cat([ctsd_block_table, extra], dim=0)
+
+        if num_scratch_needed > 0:
+            total_cache_blocks = (
+                self.kv_caches[0].shape[1]
+                if hasattr(self, "kv_caches")
+                and len(self.kv_caches) > 0
+                and hasattr(self.kv_caches[0], "shape")
+                else 1024
+            )
+            scratch_start = total_cache_blocks - num_scratch_needed
+            for b_idx in range(num_scratch_needed):
+                target_block_idx = num_prefix_blocks + b_idx
+                if target_block_idx < ctsd_block_table.shape[0]:
+                    ctsd_block_table[target_block_idx] = scratch_start + b_idx
+
+        return ctsd_block_table
+
     def sample_tokens(self, grammar_output):
         if (
             self.execute_model_state is None
@@ -174,7 +236,9 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 self._ctsd_states.pop(dead_id, None)
 
         # 2. Evaluate CTSD tree forward and select winning branch
-        committed = self._ctsd_step(req_id, root_hidden, scheduler_output, slot_mappings)
+        committed = self._ctsd_step(
+            req_id, root_hidden, scheduler_output, slot_mappings, root_logits=logits
+        )
 
         # 3. Construct SamplerOutput with committed token
         sampler_output = SamplerOutput(
@@ -246,11 +310,14 @@ class CTSDGPUModelRunner(GPUModelRunner):
 
         return output
 
-    def _ctsd_step(self, req_id, root_hidden, scheduler_output, slot_mappings):
+    def _ctsd_step(self, req_id, root_hidden, scheduler_output, slot_mappings, root_logits=None):
         """Full tree forward pass for each decode step."""
-        root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+        if root_logits is None:
+            root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+        else:
+            root_logits = root_logits.squeeze(0)
         tree_logits_per_level, tree_token_ids, tree_start_pos = self._ctsd_forward_tree(
-            root_hidden, scheduler_output, slot_mappings
+            root_hidden, scheduler_output, slot_mappings, root_logits=root_logits
         )
         committed, winning_path_idx, _ = ctsd_select(
             tree_logits_per_level,
@@ -309,7 +376,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         )
 
         # 2. Compute positions and slot mapping for the new leaves
-        block_table_tensor = self._get_block_table_tensor()
+        ctsd_block_table = self._get_ctsd_block_table(state.tree_start_pos)
         block_size = self.attn_groups[0][0].kv_cache_spec.block_size
         interior_size = self._ctsd_tree_size - num_leaves  # B + B^2 + ... + B^(D-1)
 
@@ -325,7 +392,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             num_leaves, dtype=torch.int64, device=device
         )
         b_nums = leaf_seq_pos // block_size
-        b_ids = block_table_tensor.gather(dim=0, index=b_nums)
+        b_ids = ctsd_block_table.gather(dim=0, index=b_nums)
         slot_mapping = (b_ids * block_size + leaf_seq_pos % block_size).to(torch.int64)
 
         # 3. Build CTSDTreeAttentionMetadata
@@ -343,7 +410,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             query_start_loc=torch.tensor([0, num_leaves], dtype=torch.int32, device=device),
             max_seq_len=seq_len_now,
             seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
-            block_table=block_table_tensor.unsqueeze(0),
+            block_table=ctsd_block_table.unsqueeze(0),
             slot_mapping=slot_mapping,
             num_prefill_tokens=0,
             num_decode_tokens=num_leaves,
@@ -385,8 +452,11 @@ class CTSDGPUModelRunner(GPUModelRunner):
         )
         return committed, new_state
 
-    def _ctsd_forward_tree(self, root_hidden, scheduler_output, slot_mappings):
-        root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+    def _ctsd_forward_tree(self, root_hidden, scheduler_output, slot_mappings, root_logits=None):
+        if root_logits is None:
+            root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+        else:
+            root_logits = root_logits.squeeze(0)
         breadth = self._ctsd_config.breadth
         depth = self._ctsd_config.depth
         device = self.device
@@ -397,7 +467,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         # Absolute RoPE position of the first level-1 tree node.
         tree_start_pos = num_computed + num_sched
 
-        block_table_tensor = self._get_block_table_tensor()
+        ctsd_block_table = self._get_ctsd_block_table(tree_start_pos)
         block_size = self.attn_groups[0][0].kv_cache_spec.block_size
 
         all_level_logits = []   # list of [B^k, V]
@@ -424,7 +494,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 num_nodes_this_level, dtype=torch.int64, device=device
             )
             block_numbers = level_seq_pos // block_size
-            block_ids = block_table_tensor.gather(dim=0, index=block_numbers)
+            block_ids = ctsd_block_table.gather(dim=0, index=block_numbers)
             slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int64)
 
             # tree_attn_bias for the Triton kernel: full [tree_size, tree_size] matrix
@@ -441,7 +511,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 query_start_loc=torch.tensor([0, num_nodes_this_level], dtype=torch.int32, device=device),
                 max_seq_len=seq_len_now,
                 seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
-                block_table=block_table_tensor.unsqueeze(0),
+                block_table=ctsd_block_table.unsqueeze(0),
                 slot_mapping=slot_mapping,
                 num_prefill_tokens=0,
                 num_decode_tokens=num_nodes_this_level,

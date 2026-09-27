@@ -86,3 +86,43 @@ def test_attention_impl_forward_routing():
     out2 = wrapped(impl, layer, None, None, None, None, standard_meta)
     assert out2 == "original_output"
     assert impl.called_with == "original"
+
+
+def test_ctsd_block_table_scratch_isolation():
+    """
+    Verify that _get_ctsd_block_table isolates tree nodes into scratch blocks
+    and never leaves unallocated blocks pointing to physical Block 0.
+    """
+    from vllm_ctsd.model_runner import CTSDGPUModelRunner
+
+    runner = object.__new__(CTSDGPUModelRunner)
+    runner._ctsd_tree_size = 14  # breadth=2, depth=3 -> 14 nodes
+    block_size = 16
+
+    # Mock attn_groups for block_size
+    mock_spec = MagicMock()
+    mock_spec.block_size = block_size
+    mock_group = MagicMock()
+    mock_group.kv_cache_spec = mock_spec
+    runner.attn_groups = [[mock_group]]
+
+    # Mock kv_caches: 100 total cache blocks
+    mock_cache = torch.zeros((2, 100, block_size, 2, 64))
+    runner.kv_caches = [mock_cache]
+
+    # Prompt: 25 tokens. 2 blocks allocated by vLLM (physical block 5 and 8).
+    # Unallocated block indices are 0.
+    raw_block_table = torch.tensor([5, 8, 0, 0, 0, 0], dtype=torch.int32)
+    runner._get_block_table_tensor = MagicMock(return_value=raw_block_table)
+
+    tree_start_pos = 26
+    # Prefix spans tokens 0..25 -> num_prefix_blocks = 2
+    # Tree spans up to 26 + 14 = 40 tokens -> num_total_blocks = 3
+    # Block index 2 must be remapped to scratch block (100 - 1 = 99)
+    ctsd_bt = runner._get_ctsd_block_table(tree_start_pos)
+
+    assert ctsd_bt[0].item() == 5  # Prefix block 0 preserved
+    assert ctsd_bt[1].item() == 8  # Prefix block 1 preserved
+    assert ctsd_bt[2].item() == 99  # Tree candidate block mapped to scratch, NOT 0
+    assert ctsd_bt[2].item() != 0  # CRITICAL: must never overwrite prompt block 0
+

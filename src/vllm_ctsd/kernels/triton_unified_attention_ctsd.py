@@ -569,7 +569,8 @@ def kernel_unified_attention_3d(
         if tree_size > 0 and tree_start_pos >= 0:
             query_abs_pos_row = context_len + query_pos[:, None]
             row_idx = query_abs_pos_row - tree_start_pos
-            qq_bias_row_ptrs = qq_bias_ptr + row_idx * qq_bias_stride_0
+            safe_row_idx = tl.clamp(row_idx, 0, tree_size - 1)
+            qq_bias_row_ptrs = qq_bias_ptr + safe_row_idx * qq_bias_stride_0
         else:
             qq_bias_row_ptrs = (
                 qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
@@ -743,8 +744,9 @@ def kernel_unified_attention_3d(
                     key_abs_pos - tree_start_pos,
                     key_rel_pos,
                 )
+                safe_col_idx = tl.where(is_bias_key, col_idx, 0)
                 qq_bias = tl.load(
-                    qq_bias_row_ptrs + col_idx[None, :],
+                    qq_bias_row_ptrs + safe_col_idx[None, :],
                     mask=is_bias_key[None, :],
                     other=0.0,
                 )
