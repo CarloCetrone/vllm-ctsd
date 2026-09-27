@@ -119,4 +119,14 @@ def ctsd_select(
     committed_token = int(full_token_ids[first_idx].item())
     best_path_int = int(best_path_idx.item())
 
+    import os
+    if os.environ.get("VLLM_CTSD_DEBUG", "0").lower() in ("1", "true", "yes"):
+        greedy_root = torch.argmax(full_logits[0]).item()
+        print(f"[CTSD-SELECT] Root greedy={greedy_root}, Committed={committed_token} (winning path {best_path_int})", flush=True)
+        for p in range(min(num_paths, 8)):
+            p_nodes = paths[p].tolist()
+            p_toks = [full_token_ids[n].item() if n > 0 else -1 for n in p_nodes]
+            mark = " <-- WINNER" if p == best_path_int else ""
+            print(f"  path {p}: tokens={p_toks}, avg_lp={avg_logprobs[p].item():.4f}{mark}", flush=True)
+
     return committed_token, best_path_int, avg_logprobs

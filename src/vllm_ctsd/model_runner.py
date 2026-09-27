@@ -222,6 +222,19 @@ class CTSDGPUModelRunner(GPUModelRunner):
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
 
+        import os
+        debug = os.environ.get("VLLM_CTSD_DEBUG", "0").lower() in ("1", "true", "yes")
+        step_num = getattr(self, "_debug_step_num", 0) + 1
+        self._debug_step_num = step_num
+
+        if debug:
+            prev_tok = getattr(self.input_batch, "prev_sampled_token_ids", None)
+            num_comp = int(self.input_batch.num_computed_tokens_cpu[0])
+            top5_probs, top5_ids = torch.topk(torch.softmax(logits.float().squeeze(0), dim=-1), k=5)
+            top5_str = ", ".join(f"{tid.item()}:{prob.item():.3f}" for tid, prob in zip(top5_ids, top5_probs))
+            print(f"\n[CTSD-STEP {step_num}] num_computed={num_comp}, prev_sampled={prev_tok.tolist() if prev_tok is not None else None}", flush=True)
+            print(f"[CTSD-STEP {step_num}] Root Top-5 tokens: [{top5_str}]", flush=True)
+
         root_hidden, scheduler_output, slot_mappings = self._ctsd_current_context
         req_id = self.input_batch.req_ids[0]
 
@@ -235,6 +248,8 @@ class CTSDGPUModelRunner(GPUModelRunner):
             committed = self._ctsd_step(
                 req_id, root_hidden, scheduler_output, slot_mappings, root_logits=logits
             )
+            if debug:
+                print(f"[CTSD-STEP {step_num}] Committing token {committed}", flush=True)
             return SamplerOutput(
                 sampled_token_ids=torch.tensor(
                     [[committed]], device=self.device, dtype=torch.int32
@@ -434,6 +449,10 @@ class CTSDGPUModelRunner(GPUModelRunner):
             block_numbers = level_seq_pos // block_size
             block_ids = ctsd_block_table.gather(dim=0, index=block_numbers)
             slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int64)
+
+            import os
+            if os.environ.get("VLLM_CTSD_DEBUG", "0").lower() in ("1", "true", "yes"):
+                print(f"  [Level {k}] nodes={num_nodes_this_level}, tokens={level_tokens.tolist()}, rope_pos={level_positions.tolist()}, slots={slot_mapping.tolist()}", flush=True)
 
             # tree_attn_bias for the Triton kernel: full [tree_size, tree_size] matrix
             tree_attn_bias = self._ctsd_tree_attn_bias
