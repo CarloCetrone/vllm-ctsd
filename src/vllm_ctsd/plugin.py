@@ -110,6 +110,96 @@ def register():
     except Exception:
         logger.exception("vllm-ctsd: failed to patch TreeAttentionImpl")
 
+    # 4b. Intercept standard attention backends (FlashAttention, Triton, Flashinfer)
+    # to seamlessly route CTSDTreeAttentionMetadata to CTSDTreeAttentionImpl
+    try:
+        from vllm_ctsd.tree_attention import CTSDTreeAttentionMetadata, CTSDTreeAttentionImpl
+        from vllm.v1.attention.backend import AttentionType
+
+        def _wrap_attention_forward(orig_forward):
+            def _ctsd_forward(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output=None,
+                output_scale=None,
+                output_block_scale=None,
+                **kwargs,
+            ):
+                if isinstance(attn_metadata, CTSDTreeAttentionMetadata):
+                    tree_impl = getattr(layer, "_ctsd_tree_impl", None)
+                    if tree_impl is None:
+                        tree_impl = CTSDTreeAttentionImpl(
+                            num_heads=self.num_heads,
+                            head_size=self.head_size,
+                            scale=self.scale,
+                            num_kv_heads=self.num_kv_heads,
+                            alibi_slopes=getattr(self, "alibi_slopes", None),
+                            sliding_window=getattr(layer, "sliding_window", None),
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            logits_soft_cap=getattr(self, "logits_soft_cap", None),
+                            attn_type=getattr(self, "attn_type", AttentionType.DECODER),
+                            kv_sharing_target_layer_name=getattr(self, "kv_sharing_target_layer_name", None),
+                        )
+                        tree_impl.sliding_window = getattr(self, "sliding_window", (-1, -1))
+                        layer._ctsd_tree_impl = tree_impl
+                    return tree_impl.forward(
+                        layer=layer,
+                        query=query,
+                        key=key,
+                        value=value,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        output=output,
+                        output_scale=output_scale,
+                        output_block_scale=output_block_scale,
+                        **kwargs,
+                    )
+                return orig_forward(
+                    self,
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    output=output,
+                    output_scale=output_scale,
+                    output_block_scale=output_block_scale,
+                    **kwargs,
+                )
+            return _ctsd_forward
+
+        try:
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+            if not getattr(FlashAttentionImpl, "_ctsd_patched", False):
+                FlashAttentionImpl.forward = _wrap_attention_forward(FlashAttentionImpl.forward)
+                FlashAttentionImpl._ctsd_patched = True
+        except Exception:
+            pass
+
+        try:
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+            if not getattr(TritonAttentionImpl, "_ctsd_patched", False):
+                TritonAttentionImpl.forward = _wrap_attention_forward(TritonAttentionImpl.forward)
+                TritonAttentionImpl._ctsd_patched = True
+        except Exception:
+            pass
+
+        try:
+            from vllm.v1.attention.backends.flashinfer import FlashinferAttentionImpl
+            if not getattr(FlashinferAttentionImpl, "_ctsd_patched", False):
+                FlashinferAttentionImpl.forward = _wrap_attention_forward(FlashinferAttentionImpl.forward)
+                FlashinferAttentionImpl._ctsd_patched = True
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("vllm-ctsd: failed to intercept attention backend forwards")
+
     # 5. Patch Model Runner
     try:
         import vllm.v1.worker.gpu_model_runner as gmr_module

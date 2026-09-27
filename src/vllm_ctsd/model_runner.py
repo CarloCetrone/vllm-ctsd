@@ -71,6 +71,55 @@ class CTSDGPUModelRunner(GPUModelRunner):
             # Force eager execution (no CUDA graphs for tree search)
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+    def load_model(self, *args, **kwargs):
+        super().load_model(*args, **kwargs)
+        if self._ctsd_enabled:
+            self._init_ctsd_attention_layers()
+
+    def _init_ctsd_attention_layers(self):
+        try:
+            from vllm_ctsd.tree_attention import (
+                CTSDTreeAttentionImpl,
+                CTSDTreeAttentionMetadata,
+            )
+            from vllm.v1.attention.backend import AttentionType
+
+            static_fc = getattr(self.compilation_config, "static_forward_context", {})
+            initialized_count = 0
+            for name, layer in static_fc.items():
+                if hasattr(layer, "impl") and not hasattr(layer, "_ctsd_tree_impl"):
+                    impl = layer.impl
+                    tree_impl = CTSDTreeAttentionImpl(
+                        num_heads=impl.num_heads,
+                        head_size=impl.head_size,
+                        scale=impl.scale,
+                        num_kv_heads=impl.num_kv_heads,
+                        alibi_slopes=getattr(impl, "alibi_slopes", None),
+                        sliding_window=getattr(layer, "sliding_window", None),
+                        kv_cache_dtype=impl.kv_cache_dtype,
+                        logits_soft_cap=getattr(impl, "logits_soft_cap", None),
+                        attn_type=getattr(impl, "attn_type", AttentionType.DECODER),
+                        kv_sharing_target_layer_name=getattr(impl, "kv_sharing_target_layer_name", None),
+                    )
+                    tree_impl.sliding_window = getattr(impl, "sliding_window", (-1, -1))
+                    layer._ctsd_tree_impl = tree_impl
+
+                    orig_fwd = impl.forward
+
+                    def make_inst_forward(orig, tr_impl):
+                        def inst_forward(attn_layer, query, key, value, kv_cache, attn_metadata, **kwargs):
+                            if isinstance(attn_metadata, CTSDTreeAttentionMetadata):
+                                return tr_impl.forward(attn_layer, query, key, value, kv_cache, attn_metadata, **kwargs)
+                            return orig(attn_layer, query, key, value, kv_cache, attn_metadata, **kwargs)
+                        return inst_forward
+
+                    impl.forward = make_inst_forward(orig_fwd, tree_impl)
+                    initialized_count += 1
+            if initialized_count > 0:
+                logger.info("CTSDGPUModelRunner: attached tree attention to %d layers", initialized_count)
+        except Exception:
+            logger.exception("CTSDGPUModelRunner: error pre-initializing tree attention layers")
+
     def _get_block_table_tensor(self) -> torch.Tensor:
         """Extract the 1D device tensor of block IDs for the active request."""
         bt = self.input_batch.block_table[0]
