@@ -92,7 +92,13 @@ def ctsd_select(
     else:
         full_token_ids = t_toks
 
-    log_probs = torch.log_softmax(full_logits.float(), dim=-1)
+    temperature = kwargs.get("temperature", 1.0)
+    if temperature is not None and temperature > 0 and temperature != 1.0:
+        scaled_logits = full_logits / float(temperature)
+    else:
+        scaled_logits = full_logits
+
+    log_probs = torch.log_softmax(scaled_logits.float(), dim=-1)
 
     num_paths, path_len = paths.shape
     path_lps = torch.zeros(num_paths, device=full_logits.device, dtype=torch.float32)

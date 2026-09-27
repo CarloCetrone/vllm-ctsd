@@ -291,6 +291,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             self._path_first_token_idx,
             root_logits=root_logits,
             step_num=step_num,
+            temperature=self._ctsd_config.temperature,
         )
         return committed
 
