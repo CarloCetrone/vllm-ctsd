@@ -88,6 +88,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         ):
             return super().sample_tokens(grammar_output)
 
+        saved_state = self.execute_model_state
         try:
             return self._ctsd_sample_tokens(grammar_output)
         except Exception:
@@ -95,9 +96,8 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 "CTSD step failed; falling back to standard decode",
                 exc_info=True,
             )
-            if self.execute_model_state is not None:
-                return super().sample_tokens(grammar_output)
-            raise
+            self.execute_model_state = saved_state
+            return super().sample_tokens(grammar_output)
 
     def _ctsd_sample_tokens(self, grammar_output):
         # 1. Unpack ephemeral state
@@ -304,6 +304,9 @@ class CTSDGPUModelRunner(GPUModelRunner):
         per_layer_meta = {
             layer_name: meta for layer_name in self.attn_groups[0][0].layer_names
         }
+        layer_slot_mapping = {
+            layer_name: slot_mapping for layer_name in self.attn_groups[0][0].layer_names
+        }
 
         # 4. Model forward pass over the new leaves only
         with set_forward_context(
@@ -311,7 +314,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             self.vllm_config,
             num_tokens=num_leaves,
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            slot_mapping=slot_mapping,
+            slot_mapping=layer_slot_mapping,
         ):
             hidden = self._model_forward(
                 input_ids=leaf_token_ids.to(torch.int32),
@@ -400,13 +403,16 @@ class CTSDGPUModelRunner(GPUModelRunner):
             )
 
             per_layer_meta = {name: meta for name in self.attn_groups[0][0].layer_names}
+            layer_slot_mapping = {
+                name: slot_mapping for name in self.attn_groups[0][0].layer_names
+            }
 
             with set_forward_context(
                 per_layer_meta,
                 self.vllm_config,
                 num_tokens=num_nodes_this_level,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                slot_mapping=slot_mapping,
+                slot_mapping=layer_slot_mapping,
             ):
                 hidden = self._model_forward(
                     input_ids=level_tokens.to(torch.int32),
