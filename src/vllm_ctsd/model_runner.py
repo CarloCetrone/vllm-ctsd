@@ -173,20 +173,8 @@ class CTSDGPUModelRunner(GPUModelRunner):
             if dead_id not in active_req_ids:
                 self._ctsd_states.pop(dead_id, None)
 
-        # 2. Check if request has existing interior state
-        if req_id not in self._ctsd_states:
-            # Cold-start: full tree forward pass
-            committed, state = self._ctsd_cold_start(
-                req_id, root_hidden, scheduler_output, slot_mappings
-            )
-            self._ctsd_states[req_id] = state
-        else:
-            # Steady-state: expand frontier into B^D new leaves, forward only new leaves
-            state = self._ctsd_states[req_id]
-            committed, new_state = self._ctsd_steady_state(
-                state, scheduler_output, slot_mappings
-            )
-            self._ctsd_states[req_id] = new_state
+        # 2. Evaluate CTSD tree forward and select winning branch
+        committed = self._ctsd_step(req_id, root_hidden, scheduler_output, slot_mappings)
 
         # 3. Construct SamplerOutput with committed token
         sampler_output = SamplerOutput(
@@ -257,6 +245,22 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 )
 
         return output
+
+    def _ctsd_step(self, req_id, root_hidden, scheduler_output, slot_mappings):
+        """Full tree forward pass for each decode step."""
+        root_logits = self.model.compute_logits(root_hidden).squeeze(0)
+        tree_logits_per_level, tree_token_ids, tree_start_pos = self._ctsd_forward_tree(
+            root_hidden, scheduler_output, slot_mappings
+        )
+        committed, winning_path_idx, _ = ctsd_select(
+            tree_logits_per_level,
+            tree_token_ids,
+            self._path_indices,
+            self._path_lengths,
+            self._path_first_token_idx,
+            root_logits=root_logits,
+        )
+        return committed
 
     def _ctsd_cold_start(self, req_id, root_hidden, scheduler_output, slot_mappings):
         """Full tree forward pass for initial cold-start decode step."""
@@ -423,11 +427,8 @@ class CTSDGPUModelRunner(GPUModelRunner):
             block_ids = block_table_tensor.gather(dim=0, index=block_numbers)
             slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int64)
 
-            # Row range in the sliced tree bias [tree_size, tree_size]
-            row_start = level_offset
-            row_end = row_start + num_nodes_this_level
-            col_end = row_end
-            tree_attn_bias = self._ctsd_tree_attn_bias[row_start:row_end, 0:col_end].contiguous()
+            # tree_attn_bias for the Triton kernel: full [tree_size, tree_size] matrix
+            tree_attn_bias = self._ctsd_tree_attn_bias
 
             # seq_lens for the kernel: prefix + all tree nodes written so far
             tree_nodes_written = level_offset + num_nodes_this_level
@@ -448,7 +449,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 num_decodes=1,
                 tree_attn_bias=tree_attn_bias,
                 tree_start_pos=tree_start_pos,
-                tree_size=tree_nodes_written,
+                tree_size=self._ctsd_tree_size,
             )
 
             per_layer_meta = {name: meta for name in self.attn_groups[0][0].layer_names}
