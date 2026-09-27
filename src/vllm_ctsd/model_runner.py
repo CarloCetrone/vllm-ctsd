@@ -193,40 +193,36 @@ class CTSDGPUModelRunner(GPUModelRunner):
 
     def sample_tokens(self, grammar_output):
         if (
-            self.execute_model_state is None
-            or not self._ctsd_enabled
+            self.execute_model_state is not None
+            and self._ctsd_enabled
+            and len(self.input_batch.req_ids) == 1
+        ):
+            self._ctsd_current_context = (
+                self.execute_model_state.sample_hidden_states,
+                self.execute_model_state.scheduler_output,
+                self.execute_model_state.slot_mappings,
+            )
+        else:
+            self._ctsd_current_context = None
+
+        try:
+            return super().sample_tokens(grammar_output)
+        finally:
+            self._ctsd_current_context = None
+
+    def _sample(self, logits, spec_decode_metadata):
+        if (
+            not self._ctsd_enabled
+            or getattr(self, "_ctsd_current_context", None) is None
             or len(self.input_batch.req_ids) != 1
         ):
-            return super().sample_tokens(grammar_output)
+            return super()._sample(logits, spec_decode_metadata)
 
-        saved_state = self.execute_model_state
-        try:
-            return self._ctsd_sample_tokens(grammar_output)
-        except Exception:
-            logger.warning(
-                "CTSD step failed; falling back to standard decode",
-                exc_info=True,
-            )
-            self.execute_model_state = saved_state
-            return super().sample_tokens(grammar_output)
+        # Update output token ids with tokens sampled in last step
+        # if async scheduling and required by current sampling params.
+        self.input_batch.update_async_output_token_ids()
 
-    def _ctsd_sample_tokens(self, grammar_output):
-        # 1. Unpack ephemeral state
-        (
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            ec_connector_output,
-            cudagraph_stats,
-            slot_mappings,
-        ) = self.execute_model_state
-        self.execute_model_state = None
-
-        root_hidden = sample_hidden_states  # [1, H]
+        root_hidden, scheduler_output, slot_mappings = self._ctsd_current_context
         req_id = self.input_batch.req_ids[0]
 
         # Clean up any state for inactive requests
@@ -235,80 +231,22 @@ class CTSDGPUModelRunner(GPUModelRunner):
             if dead_id not in active_req_ids:
                 self._ctsd_states.pop(dead_id, None)
 
-        # 2. Evaluate CTSD tree forward and select winning branch
-        committed = self._ctsd_step(
-            req_id, root_hidden, scheduler_output, slot_mappings, root_logits=logits
-        )
-
-        # 3. Construct SamplerOutput with committed token
-        sampler_output = SamplerOutput(
-            sampled_token_ids=torch.tensor(
-                [[committed]], device=self.device, dtype=torch.int32
-            ),
-            logprobs_tensors=None,
-        )
-
-        # 4. Bookkeeping synchronization
-        (
-            num_nans_in_logits,
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        ) = self._bookkeeping_sync(
-            scheduler_output,
-            sampler_output,
-            logits,
-            hidden_states,
-            scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
-        )
-
-        # Clean up state on request completion
-        if req_id in invalid_req_indices:
-            self._ctsd_states.pop(req_id, None)
-
-        # 5. Build ModelRunnerOutput
-        output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            kv_connector_output=None,
-            ec_connector_output=ec_connector_output
-            if self.supports_mm_inputs
-            else None,
-            num_nans_in_logits=num_nans_in_logits,
-            cudagraph_stats=cudagraph_stats,
-        )
-
-        if getattr(self, "use_async_scheduling", False):
-            try:
-                from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
-
-                async_output = AsyncGPUModelRunnerOutput(
-                    model_runner_output=output,
-                    sampled_token_ids=sampler_output.sampled_token_ids,
-                    logprobs_tensors=sampler_output.logprobs_tensors,
-                    invalid_req_indices=invalid_req_indices,
-                    async_output_copy_stream=self.async_output_copy_stream,
-                    vocab_size=self.input_batch.vocab_size,
-                )
-                self.input_batch.set_async_sampled_token_ids(
-                    async_output.sampled_token_ids_cpu,
-                    async_output.async_copy_ready_event,
-                )
-                return async_output
-            except Exception:
-                logger.warning(
-                    "Failed to create AsyncGPUModelRunnerOutput, returning synchronous output",
-                    exc_info=True,
-                )
-
-        return output
+        try:
+            committed = self._ctsd_step(
+                req_id, root_hidden, scheduler_output, slot_mappings, root_logits=logits
+            )
+            return SamplerOutput(
+                sampled_token_ids=torch.tensor(
+                    [[committed]], device=self.device, dtype=torch.int32
+                ),
+                logprobs_tensors=None,
+            )
+        except Exception:
+            logger.warning(
+                "CTSD step failed; falling back to standard sampler",
+                exc_info=True,
+            )
+            return super()._sample(logits, spec_decode_metadata)
 
     def _ctsd_step(self, req_id, root_hidden, scheduler_output, slot_mappings, root_logits=None):
         """Full tree forward pass for each decode step."""
