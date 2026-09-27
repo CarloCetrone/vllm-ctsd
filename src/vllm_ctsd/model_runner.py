@@ -273,7 +273,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         )
         b_nums = leaf_seq_pos // block_size
         b_ids = block_table_tensor.gather(dim=0, index=b_nums)
-        slot_mapping = (b_ids * block_size + leaf_seq_pos % block_size).to(torch.int32)
+        slot_mapping = (b_ids * block_size + leaf_seq_pos % block_size).to(torch.int64)
 
         # 3. Build CTSDTreeAttentionMetadata
         row_start = interior_size
@@ -372,7 +372,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             )
             block_numbers = level_seq_pos // block_size
             block_ids = block_table_tensor.gather(dim=0, index=block_numbers)
-            slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int32)
+            slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int64)
 
             # Row range in the sliced tree bias [tree_size, tree_size]
             row_start = level_offset
