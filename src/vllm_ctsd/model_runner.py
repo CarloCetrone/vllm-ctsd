@@ -246,10 +246,13 @@ class CTSDGPUModelRunner(GPUModelRunner):
 
         try:
             committed = self._ctsd_step(
-                req_id, root_hidden, scheduler_output, slot_mappings, root_logits=logits
+                req_id,
+                root_hidden,
+                scheduler_output,
+                slot_mappings,
+                root_logits=logits,
+                step_num=step_num,
             )
-            if debug:
-                print(f"[CTSD-STEP {step_num}] Committing token {committed}", flush=True)
             return SamplerOutput(
                 sampled_token_ids=torch.tensor(
                     [[committed]], device=self.device, dtype=torch.int32
@@ -263,7 +266,15 @@ class CTSDGPUModelRunner(GPUModelRunner):
             )
             return super()._sample(logits, spec_decode_metadata)
 
-    def _ctsd_step(self, req_id, root_hidden, scheduler_output, slot_mappings, root_logits=None):
+    def _ctsd_step(
+        self,
+        req_id,
+        root_hidden,
+        scheduler_output,
+        slot_mappings,
+        root_logits=None,
+        step_num=None,
+    ):
         """Full tree forward pass for each decode step."""
         if root_logits is None:
             root_logits = self.model.compute_logits(root_hidden).squeeze(0)
@@ -279,6 +290,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             self._path_lengths,
             self._path_first_token_idx,
             root_logits=root_logits,
+            step_num=step_num,
         )
         return committed
 
