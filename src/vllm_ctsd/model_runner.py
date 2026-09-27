@@ -184,6 +184,29 @@ class CTSDGPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
         )
 
+        if getattr(self, "use_async_scheduling", False):
+            try:
+                from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
+
+                async_output = AsyncGPUModelRunnerOutput(
+                    model_runner_output=output,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                    logprobs_tensors=sampler_output.logprobs_tensors,
+                    invalid_req_indices=invalid_req_indices,
+                    async_output_copy_stream=self.async_output_copy_stream,
+                    vocab_size=self.input_batch.vocab_size,
+                )
+                self.input_batch.set_async_sampled_token_ids(
+                    async_output.sampled_token_ids_cpu,
+                    async_output.async_copy_ready_event,
+                )
+                return async_output
+            except Exception:
+                logger.warning(
+                    "Failed to create AsyncGPUModelRunnerOutput, returning synchronous output",
+                    exc_info=True,
+                )
+
         return output
 
     def _ctsd_cold_start(self, req_id, root_hidden, scheduler_output, slot_mappings):
