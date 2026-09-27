@@ -46,9 +46,12 @@ class CTSDGPUModelRunner(GPUModelRunner):
             topology = self._ctsd_config.build_topology()
             self._ctsd_topology = topology
             self._ctsd_tree_size = self._ctsd_config.tree_size
+            # Pre-compute and slice tree attention bias to [tree_size, tree_size].
+            # Index 0 is root, which resides in prefix (before tree_start_pos)
+            # and is attended to causally with 0.0 bias in the kernel.
             self._ctsd_tree_attn_bias = build_tree_attn_bias(
                 topology, device, torch.float32
-            )
+            )[1:, 1:].contiguous()
 
             # Pre-cache tensors on GPU
             self._path_indices = torch.tensor(
@@ -67,6 +70,15 @@ class CTSDGPUModelRunner(GPUModelRunner):
 
             # Force eager execution (no CUDA graphs for tree search)
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    def _get_block_table_tensor(self) -> torch.Tensor:
+        """Extract the 1D device tensor of block IDs for the active request."""
+        bt = self.input_batch.block_table[0]
+        if hasattr(bt, "get_device_tensor"):
+            return bt.get_device_tensor(1)[0]
+        elif hasattr(bt, "block_table") and hasattr(bt.block_table, "gpu"):
+            return bt.block_table.gpu[0]
+        return bt[0]
 
     def sample_tokens(self, grammar_output):
         if (
@@ -221,26 +233,31 @@ class CTSDGPUModelRunner(GPUModelRunner):
         )
 
         # 2. Compute positions and slot mapping for the new leaves
-        block_table = self.input_batch.block_table[0]
+        block_table_tensor = self._get_block_table_tensor()
         block_size = self.attn_groups[0][0].kv_cache_spec.block_size
+        interior_size = self._ctsd_tree_size - num_leaves  # B + B^2 + ... + B^(D-1)
 
+        # RoPE positions for leaves (depth D from root)
         leaf_pos = torch.full(
             (num_leaves,),
             state.tree_start_pos + depth - 1,
             dtype=torch.int64,
             device=device,
         )
-        b_nums = leaf_pos // block_size
-        b_ids = block_table.gather(dim=0, index=b_nums)
-        slot_mapping = (b_ids * block_size + leaf_pos % block_size).to(torch.int32)
+        # Sequential KV cache positions for leaves so each leaf gets its own slot
+        leaf_seq_pos = state.tree_start_pos + interior_size + torch.arange(
+            num_leaves, dtype=torch.int64, device=device
+        )
+        b_nums = leaf_seq_pos // block_size
+        b_ids = block_table_tensor.gather(dim=0, index=b_nums)
+        slot_mapping = (b_ids * block_size + leaf_seq_pos % block_size).to(torch.int32)
 
         # 3. Build CTSDTreeAttentionMetadata
-        interior_size = self._ctsd_tree_size - num_leaves  # B + B^2 + ... + B^(D-1)
-        row_start = interior_size + 1
-        row_end = self._ctsd_tree_size + 1
-        col_end = self._ctsd_tree_size + 1
+        row_start = interior_size
+        row_end = self._ctsd_tree_size
+        col_end = self._ctsd_tree_size
         tree_attn_bias = self._ctsd_tree_attn_bias[row_start:row_end, 0:col_end].contiguous()
-        assert tree_attn_bias.shape == (num_leaves, self._ctsd_tree_size + 1)
+        assert tree_attn_bias.shape == (num_leaves, self._ctsd_tree_size)
 
         seq_len_now = state.tree_start_pos + self._ctsd_tree_size
 
@@ -250,7 +267,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
             query_start_loc=torch.tensor([0, num_leaves], dtype=torch.int32, device=device),
             max_seq_len=seq_len_now,
             seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
-            block_table=block_table.unsqueeze(0),
+            block_table=block_table_tensor.unsqueeze(0),
             slot_mapping=slot_mapping,
             num_prefill_tokens=0,
             num_decode_tokens=num_leaves,
@@ -301,7 +318,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
         # Absolute RoPE position of the first level-1 tree node.
         tree_start_pos = num_computed + num_sched
 
-        block_table = self.input_batch.block_table[0]
+        block_table_tensor = self._get_block_table_tensor()
         block_size = self.attn_groups[0][0].kv_cache_spec.block_size
 
         all_level_logits = []   # list of [B^k, V]
@@ -317,27 +334,27 @@ class CTSDGPUModelRunner(GPUModelRunner):
             level_tokens = top_ids.reshape(-1)  # [num_parents * B] = [B^k]
 
             num_nodes_this_level = level_tokens.shape[0]
-            # Absolute positions: all level-k nodes sit at RoPE position tree_start_pos + k - 1
+            # Absolute RoPE positions: all level-k nodes sit at depth k (RoPE position tree_start_pos + k - 1)
             level_positions = torch.full(
                 (num_nodes_this_level,), tree_start_pos + k - 1,
                 dtype=torch.int64, device=device,
             )
 
-            # Slot mapping via block table
-            block_numbers = level_positions // block_size
-            block_ids = block_table.gather(dim=0, index=block_numbers)
-            slot_mapping = (block_ids * block_size + level_positions % block_size).to(torch.int32)
+            # Sequential KV cache sequence positions so each node gets its own slot
+            level_seq_pos = tree_start_pos + level_offset + torch.arange(
+                num_nodes_this_level, dtype=torch.int64, device=device
+            )
+            block_numbers = level_seq_pos // block_size
+            block_ids = block_table_tensor.gather(dim=0, index=block_numbers)
+            slot_mapping = (block_ids * block_size + level_seq_pos % block_size).to(torch.int32)
 
-            # Row range in the full tree bias: node indices at level k are
-            # [level_offset + 1, level_offset + num_nodes_this_level + 1)
-            # (index 0 is root). Columns include root + all nodes up to level k.
-            row_start = level_offset + 1
+            # Row range in the sliced tree bias [tree_size, tree_size]
+            row_start = level_offset
             row_end = row_start + num_nodes_this_level
-            col_end = level_offset + num_nodes_this_level + 1  # inclusive of root
+            col_end = row_end
             tree_attn_bias = self._ctsd_tree_attn_bias[row_start:row_end, 0:col_end].contiguous()
 
             # seq_lens for the kernel: prefix + all tree nodes written so far
-            # (nodes at levels 1..k have been written at this point).
             tree_nodes_written = level_offset + num_nodes_this_level
             prefix_len = tree_start_pos
             seq_len_now = prefix_len + tree_nodes_written
@@ -348,7 +365,7 @@ class CTSDGPUModelRunner(GPUModelRunner):
                 query_start_loc=torch.tensor([0, num_nodes_this_level], dtype=torch.int32, device=device),
                 max_seq_len=seq_len_now,
                 seq_lens=torch.tensor([seq_len_now], dtype=torch.int32, device=device),
-                block_table=block_table.unsqueeze(0),
+                block_table=block_table_tensor.unsqueeze(0),
                 slot_mapping=slot_mapping,
                 num_prefill_tokens=0,
                 num_decode_tokens=num_nodes_this_level,

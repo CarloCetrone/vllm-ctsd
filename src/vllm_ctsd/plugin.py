@@ -7,12 +7,13 @@ logger = logging.getLogger("vllm_ctsd")
 
 
 def register():
-    if vllm_ctsd._REGISTERED:
-        return
     cfg = CTSDConfig.from_env()
     if not cfg.enabled:
         logger.info("vllm-ctsd: disabled (VLLM_CTSD_ENABLE not set)")
         vllm_ctsd._REGISTERED = True
+        return
+
+    if getattr(vllm_ctsd, "_ACTIVATED", False):
         return
 
     logger.info(
@@ -115,4 +116,24 @@ def register():
     except Exception:
         logger.exception("vllm-ctsd: failed to patch Scheduler")
 
+    # 7. Patch KVCacheManager.allocate_slots to guarantee tree slots during prefill & decode
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        _orig_allocate_slots = KVCacheManager.allocate_slots
+
+        def _patched_allocate_slots(self, request, num_new_tokens, *args, **kwargs):
+            cfg_now = CTSDConfig.from_env()
+            if cfg_now.enabled:
+                curr_lookahead = kwargs.get("num_lookahead_tokens", 0)
+                needed = cfg_now.tree_size + 1
+                if curr_lookahead < needed:
+                    kwargs["num_lookahead_tokens"] = needed
+            return _orig_allocate_slots(self, request, num_new_tokens, *args, **kwargs)
+
+        KVCacheManager.allocate_slots = _patched_allocate_slots
+    except Exception:
+        logger.exception("vllm-ctsd: failed to patch KVCacheManager.allocate_slots")
+
     vllm_ctsd._REGISTERED = True
+    vllm_ctsd._ACTIVATED = True
