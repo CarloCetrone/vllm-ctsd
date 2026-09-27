@@ -21,6 +21,38 @@ def register():
         f"depth={cfg.depth} tree_size={cfg.tree_size}"
     )
 
+    # 0. Patch suppress_stdout to avoid UnsupportedOperation: fileno in Jupyter/Colab
+    try:
+        import sys
+        from contextlib import contextmanager
+        import vllm.utils.system_utils as su
+
+        _orig_suppress = su.suppress_stdout
+
+        @contextmanager
+        def _safe_suppress_stdout():
+            try:
+                sys.stdout.fileno()
+            except Exception:
+                yield
+                return
+            with _orig_suppress():
+                yield
+
+        su.suppress_stdout = _safe_suppress_stdout
+        try:
+            import vllm.distributed.parallel_state as ps
+            ps.suppress_stdout = _safe_suppress_stdout
+        except Exception:
+            pass
+        try:
+            import vllm.distributed.utils as du
+            du.suppress_stdout = _safe_suppress_stdout
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     # 1. Force attention backend to TREE_ATTN via AttentionConfig.__init__
     try:
         from vllm.config import AttentionConfig
